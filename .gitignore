@@ -1,0 +1,11 @@
+.conda-env/
+.conda-pkgs/
+.matplotlib-cache/
+__pycache__/
+*.py[cod]
+.venv/
+/.env
+/data/*
+!/data/README.md
+/results/
+2026_CQU_MCM_Problem_C_DATA.csv

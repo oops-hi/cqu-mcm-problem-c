@@ -1,0 +1,12 @@
+name: cqu-problem-c
+channels:
+  - defaults
+dependencies:
+  - python=3.11.18
+  - numpy=1.26.4
+  - pandas=3.0.6
+  - scipy=1.17.1
+  - scikit-learn=1.9.1
+  - networkx=3.6.1
+  - matplotlib-base=3.11.2
+  - threadpoolctl=3.7.0
