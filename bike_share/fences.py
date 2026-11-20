@@ -41,10 +41,14 @@ def fine_profiles(rides, zones, zone_id, days):
     return cells, flows
 
 
-def design_layout(distance, occupancy, weight, sites, walk_limit=0.35, max_sites=8):
-    """Allocate cells to individual facilities and size them against hourly occupancy."""
+def design_layout(distance, occupancy, weight, sites, walk_limit=0.35, max_sites=8,
+                  fixed_resources=None, worst_weight=0.0):
+    """Allocate cells to facilities and size them against one or more hourly profiles."""
+    profiles = occupancy[None, :, :] if occupancy.ndim == 2 else occupancy
+    scenarios, hours, n = profiles.shape
+    occupancy = profiles.reshape(scenarios*hours, n)
+    periods = len(occupancy)
     candidates = len(sites)
-    n, hours = occupancy.shape[1], occupancy.shape[0]
     pairs = [(i, j) for i in range(n) for j in range(candidates)
              if distance[i, sites[j]] <= walk_limit]
     a_count = len(pairs)
@@ -52,7 +56,8 @@ def design_layout(distance, occupancy, weight, sites, walk_limit=0.35, max_sites
     opened = omitted + n
     capacity = opened + candidates
     spill = capacity + candidates
-    size = spill + candidates * hours
+    worst = spill + candidates * periods
+    size = worst + int(worst_weight > 0)
     by_cell = [[] for _ in range(n)]
     by_site = [[] for _ in range(candidates)]
     for a, (i, j) in enumerate(pairs):
@@ -65,12 +70,18 @@ def design_layout(distance, occupancy, weight, sites, walk_limit=0.35, max_sites
     cost[omitted:opened] = 3.0 * weight + occupancy.mean(axis=0) + 0.01
     cost[opened:capacity] = 20.0
     cost[capacity:spill] = 0.05
-    cost[spill:] = 1.2
+    cost[spill:worst] = 1.2 * (1-worst_weight) / scenarios
+    if worst_weight > 0:
+        cost[worst] = 1.2 * worst_weight
     upper = np.full(size, np.inf)
     upper[:capacity] = 1
     site_limit = 220
     upper[capacity:spill] = site_limit
     budget = min(max_sites * site_limit, max(100, int(np.ceil(0.85 * occupancy.sum(axis=1).max()))))
+    min_sites, min_capacity = 1, -np.inf
+    if fixed_resources is not None:
+        min_sites, min_capacity = fixed_resources
+        max_sites, budget = min_sites, min_capacity
     integrality = np.zeros(size, dtype="int8")
     integrality[:spill] = 1
 
@@ -89,16 +100,22 @@ def design_layout(distance, occupancy, weight, sites, walk_limit=0.35, max_sites
 
     for i, indices in enumerate(by_cell):
         constraint([(a, 1) for a in indices] + [(omitted+i, 1)], 1, 1)
-    constraint([(opened+j, 1) for j in range(candidates)], 1, max_sites)
-    constraint([(capacity+j, 1) for j in range(candidates)], upper=budget)
+    constraint([(opened+j, 1) for j in range(candidates)], min_sites, max_sites)
+    constraint([(capacity+j, 1) for j in range(candidates)], min_capacity, budget)
     for j, assigned in enumerate(by_site):
         constraint([(capacity+j, 1), (opened+j, -site_limit)], upper=0)
         constraint([(capacity+j, -1), (opened+j, 10)], upper=0)
         for a, _ in assigned:
             constraint([(a, 1), (opened+j, -1)], upper=0)
-        for t in range(hours):
+        for t in range(periods):
             constraint([(a, occupancy[t, i]) for a, i in assigned] +
-                       [(capacity+j, -1), (spill + j*hours+t, -1)], upper=0)
+                       [(capacity+j, -1), (spill + j*periods+t, -1)], upper=0)
+
+    if worst_weight > 0:
+        for s in range(scenarios):
+            uncovered = [(omitted+i, q) for i, q in enumerate(profiles[s].sum(axis=0))]
+            overflow = [(spill+j*periods+s*hours+t, 1) for j in range(candidates) for t in range(hours)]
+            constraint(uncovered + overflow + [(worst, -1)], upper=0)
 
     matrix = coo_matrix((values, (row, col)), shape=(len(lower_bounds), size)).tocsc()
     result = milp(cost, integrality=integrality, bounds=Bounds(np.zeros(size), upper),
@@ -163,18 +180,28 @@ def plan_pilots(rides, zones, tests=("2017-05-19", "2017-05-21"), count=3):
     layout_rows, evaluations, assignments = [], [], []
     for zone in pilots:
         weekdays = [d for d in TRAIN if not is_weekend(d)]
-        cells, flows = fine_profiles(rides, zones, zone, (*weekdays, *tests))
-        departure, arrival = np.mean([flows[d] for d in weekdays], axis=0)
-        net = (arrival-departure).cumsum(axis=0)
-        start = np.maximum(0, -net.min(axis=0))
-        nominal = start + net
-        weight = arrival.sum(axis=0)
+        weekends = [d for d in TRAIN if is_weekend(d)]
+        cells, flows = fine_profiles(rides, zones, zone, (*TRAIN, *tests))
+
+        def training_profile(dates):
+            departure, arrival = np.mean([flows[d] for d in dates], axis=0)
+            net = (arrival-departure).cumsum(axis=0)
+            opening = np.maximum(0, -net.min(axis=0))
+            return opening, opening + net, arrival.sum(axis=0)
+
+        start, nominal, weight = training_profile(weekdays)
+        _, weekend, weekend_weight = training_profile(weekends)
         xy = rides.coordinates[cells]
         distance = haversine(xy[:, None, :], xy[None, :, :])
         candidates = np.argsort(-weight, kind="stable")[:min(16, np.count_nonzero(weight))]
         optimum = design_layout(distance, nominal, weight, candidates)
         baseline = popularity_layout(distance, weight, len(optimum.active), int(optimum.capacity.sum()))
-        for key, design in [("popular_equal", baseline), ("optimized", optimum)]:
+        mixed_weight = 0.5 * (weight + weekend_weight)
+        mixed_candidates = np.argsort(-mixed_weight, kind="stable")[:min(16, np.count_nonzero(mixed_weight))]
+        robust = design_layout(distance, np.stack((nominal, weekend)), mixed_weight, mixed_candidates,
+                               fixed_resources=(len(optimum.active), int(optimum.capacity.sum())),
+                               worst_weight=0.35)
+        for key, design in [("popular_equal", baseline), ("optimized", optimum), ("multi_scenario", robust)]:
             for loc, j in enumerate(design.active):
                 layout_rows.append({
                     "pilot_zone": zones.labels[zone], "layout": key,
@@ -190,9 +217,11 @@ def plan_pilots(rides, zones, tests=("2017-05-19", "2017-05-21"), count=3):
                     "assigned_to": rides.codes[cells[design.active[j]]] if j >= 0 else "",
                     "training_mean_daily_returns": weight[pos],
                 })
-            for date in ("train_weekday_average", *tests):
+            for date in ("train_weekday_average", "train_weekend_average", *tests):
                 if date == "train_weekday_average":
                     occupancy, daily_weight = nominal, weight
+                elif date == "train_weekend_average":
+                    occupancy, daily_weight = weekend, weekend_weight
                 else:
                     dep, arr = flows[date]
                     occupancy = np.maximum(0, start + (arr-dep).cumsum(axis=0))

@@ -40,6 +40,12 @@ def model_tables(out, rides, zones, od, predicted, metrics, schedules, slots,
     }), out, "zones")
     score_table = pd.DataFrame(metrics)
     save(score_table, out, "policy_metrics")
+    comparison = (score_table[~score_table["scenario"].str.startswith("sensitivity_")]
+                  .groupby("scenario", as_index=False, sort=False)
+                  [["in_area_orders", "simulated_missed", "estimated_truck_km", "bikes_trucked",
+                    "reward_spend", "accepted"]].sum())
+    comparison["simulated_missed_rate"] = comparison["simulated_missed"] / comparison["in_area_orders"]
+    save(comparison, out, "policy_comparison")
     sensitivity = score_table[score_table["scenario"].str.startswith("sensitivity_")]
     save(sensitivity, out, "sensitivity")
     route_columns = ["date", "truck", "dispatch_minute", "truck_start", "pickup", "dropoff",
@@ -47,7 +53,13 @@ def model_tables(out, rides, zones, od, predicted, metrics, schedules, slots,
                      "estimated_km", "scenario"]
     routes = pd.concat(schedules, ignore_index=True) if schedules else pd.DataFrame(columns=route_columns)
     save(routes, out, "truck_schedule")
-    save(pd.concat(slots, ignore_index=True), out, "slot_metrics")
+    slot_table = pd.concat(slots, ignore_index=True)
+    save(slot_table, out, "slot_metrics")
+    decisions = slot_table[slot_table["rolling_status"].notna()]
+    diagnostic_columns = ["date", "scenario", "slot", "rolling_scale", "rolling_candidates",
+                          "rolling_status", "rolling_jobs", "rolling_mip_gap",
+                          "rolling_baseline_shortage", "rolling_objective"]
+    save(decisions.reindex(columns=diagnostic_columns), out, "rolling_diagnostics")
     save(fences, out, "fence_sites")
     save(fence_evaluation, out, "fence_evaluation")
     save(assignment, out, "fence_assignments")
@@ -78,8 +90,9 @@ def model_tables(out, rides, zones, od, predicted, metrics, schedules, slots,
         "test_dates": list(TEST),
         "retained_training_endpoint_share": float(zones.trips[:-1].sum()/zones.trips.sum()),
         "selected_forecast": selected,
-        "solver": {"dispatch": "max flow/min-cost + greedy truck assignment",
-                   "fence": "scipy.optimize.milp / HiGHS"},
+        "solver": {"dispatch_baseline": "max flow/min-cost + greedy truck assignment",
+                   "dispatch_rolling": "scenario-weighted truck assignment with timed deliveries / HiGHS MILP",
+                   "fence": "weekday and mixed weekday-weekend layouts / HiGHS MILP"},
         "settings": settings.__dict__,
         "analysis_scope": {"dispatch": "mixed-resolution city zones, no dispatch to/from EXTERNAL",
                            "geofences": "three high-volume six-character pilot cells"},
@@ -99,14 +112,14 @@ def plot_results(out, od, predictions, chosen, fences, assignments, metrics):
         axes[0].plot(np.arange(24), fit, linestyle=":", linewidth=1.5, color=color)
     axes[0].legend(frameon=False, fontsize=9)
     axes[0].set(xlabel="Hour (dotted = forecast)", ylabel="Ride starts", title="Held-out demand profiles")
-    labels = ["no_dispatch", "greedy", "optimized", "optimized_dynamic"]
+    labels = ["no_dispatch", "greedy", "optimized", "rolling", "rolling_service"]
     x = np.arange(len(labels))
     table = pd.DataFrame(metrics)
     for index, (day, color) in enumerate(zip(TEST, palette)):
         sample = table[table["date"] == day].set_index("scenario").loc[labels]
         axes[1].bar(x+(index-1)*0.24, sample["simulated_missed_rate"]*100, width=0.22,
                     color=color, label=day[5:])
-    axes[1].set_xticks(x, ["No dispatch", "Greedy", "Optimized", "Opt. + rewards"], rotation=15)
+    axes[1].set_xticks(x, ["No dispatch", "Greedy", "Flow", "Rolling", "Rolling service"], rotation=15)
     axes[1].set(ylabel="Simulated unserved (%)", title="Same requests and initial stock")
     axes[1].legend(frameon=False, fontsize=9)
     for axis in axes:
@@ -120,8 +133,8 @@ def plot_results(out, od, predictions, chosen, fences, assignments, metrics):
     fig, axes = plt.subplots(1, len(pilots), figsize=(4.05*len(pilots), 4.1),
                              squeeze=False, layout="constrained")
     for ax, pilot in zip(axes[0], pilots):
-        points = assignments[(assignments["pilot_zone"] == pilot) & (assignments["layout"] == "optimized")]
-        fit = fences[(fences["pilot_zone"] == pilot) & (fences["layout"] == "optimized")]
+        points = assignments[(assignments["pilot_zone"] == pilot) & (assignments["layout"] == "multi_scenario")]
+        fit = fences[(fences["pilot_zone"] == pilot) & (fences["layout"] == "multi_scenario")]
         covered = points["assigned_to"] != ""
         ax.scatter(points["longitude"], points["latitude"], c=np.where(covered, "#90c9c3", "#c8c6c2"),
                    s=10 + 8*np.sqrt(points["training_mean_daily_returns"]), edgecolors="white", linewidth=0.6)
@@ -182,6 +195,17 @@ def main():
         "optimized_dynamic": {"dispatch": "optimized", "incentive": "dynamic"},
         "dynamic_low": {"dispatch": "optimized", "incentive": "dynamic", "response": "low"},
         "dynamic_high": {"dispatch": "optimized", "incentive": "dynamic", "response": "high"},
+        "rolling": {"dispatch": "rolling"},
+        "rolling_service": {"dispatch": "rolling", "km_penalty": 0.15},
+        "rolling_no_scale": {"dispatch": "rolling", "calibrate": False},
+        "greedy_fixed": {"dispatch": "greedy", "incentive": "fixed"},
+        "greedy_dynamic": {"dispatch": "greedy", "incentive": "dynamic"},
+        "greedy_fixed_cap100": {"dispatch": "greedy", "incentive": "fixed", "reward_budget": 100},
+        "greedy_dynamic_cap100": {"dispatch": "greedy", "incentive": "dynamic", "reward_budget": 100},
+        "rolling_service_fixed_cap100": {"dispatch": "rolling", "km_penalty": 0.15,
+                                         "incentive": "fixed", "reward_budget": 100},
+        "rolling_service_dynamic_cap100": {"dispatch": "rolling", "km_penalty": 0.15,
+                                           "incentive": "dynamic", "reward_budget": 100},
     }
     for day in TEST:
         day_model = DayModel(rides, zones, day, predicted[day][selected], distance, settings)
@@ -194,6 +218,8 @@ def main():
                                  ("speed_09", {"speed": 9.0}), ("speed_16", {"speed": 16.0})]:
                 cases["sensitivity_" + key + "_none"] = variant
                 cases["sensitivity_" + key + "_optimized"] = {"dispatch": "optimized", **variant}
+                if key in ("stock_015", "stock_040"):
+                    cases["sensitivity_" + key + "_rolling"] = {"dispatch": "rolling", **variant}
         for name, params in cases.items():
             result, route, series = day_model.run(**params)
             metrics.append({"scenario": name, **result})

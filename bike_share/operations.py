@@ -1,5 +1,6 @@
 """Dynamic dispatch, user incentives and vehicle-conserving replay."""
 
+from collections import defaultdict
 from dataclasses import dataclass
 
 import networkx as nx
@@ -7,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .demand import SLOTS, STEP_MINUTES, arrivals_from_od, haversine, opening_stock, ride_lag
+from .rolling import recent_order_scale, solve_dispatch, timed_trip
 
 
 @dataclass(frozen=True)
@@ -22,6 +24,9 @@ class Settings:
     lookahead: int = 8
     reference_stock_factor: float = 0.25
     dispatch_ranges: tuple = ((5, 9), (11, 14), (15, 19))
+    rolling_km_penalty: float = 0.50
+    rolling_trip_penalty: float = 0.75
+    rolling_solver_seconds: float = 2.0
 
 
 class DayModel:
@@ -72,8 +77,47 @@ class DayModel:
             minute = self.rides.minute[self.indices] % STEP_MINUTES
             offset = minute + self.rides.second[self.indices] / 60
             lag = ride_lag(self.distance_of_ride, speed, offset)
-            self._states[key] = (start_stock, carry, target.astype("int32"), lag)
+            self._states[key] = (start_stock, carry, target.astype("int32"), lag, expected_arrivals)
         return self._states[key]
+
+    def record_dispatch(self, truck, slot, trip, stock, locations, available, pending, log):
+        minute = slot * STEP_MINUTES
+        if (locations[truck] != trip.start or available[truck] > minute or
+                not 0 < trip.quantity <= min(stock[trip.pickup], self.settings.truck_capacity) or
+                not slot < trip.arrival_slot < SLOTS):
+            raise RuntimeError("Infeasible truck job in replay.")
+        stock[trip.pickup] -= trip.quantity  # reserve bikes as soon as the truck is committed
+        pending[trip.arrival_slot, trip.dropoff] += trip.quantity
+        locations[truck] = trip.dropoff
+        available[truck] = trip.arrival_slot * STEP_MINUTES
+        log.append({
+            "date": self.day, "truck": truck+1, "dispatch_minute": minute,
+            "truck_start": self.zones.labels[trip.start], "pickup": self.zones.labels[trip.pickup],
+            "dropoff": self.zones.labels[trip.dropoff], "bikes": trip.quantity,
+            "pickup_minute": round(trip.pickup_minute, 2),
+            "arrival_minute": trip.arrival_slot * STEP_MINUTES, "empty_km": trip.empty_km,
+            "loaded_km": trip.loaded_km, "estimated_km": trip.km,
+        })
+
+    def dispatch_rolling(self, t, stock, truck_location, truck_until, pending, log,
+                         arrivals, scale, km_penalty):
+        cfg = self.settings
+        minute = t * STEP_MINUTES
+        if not any(a <= minute / 60 < b for a, b in cfg.dispatch_ranges):
+            return {}
+        groups = defaultdict(list)
+        for k in np.flatnonzero(truck_until <= minute):
+            groups[int(truck_location[k])].append(int(k))
+        if not groups:
+            return {"rolling_scale": scale, "rolling_status": "no_idle_truck"}
+        window = slice(t, min(SLOTS, t+cfg.lookahead))
+        jobs, details = solve_dispatch(self.distance, cfg, t, stock, self.departures[window],
+                                       arrivals[window], pending[window], groups, scale, km_penalty)
+        for trip, quantity in jobs:
+            for _ in range(quantity):
+                truck = groups[trip.start].pop()
+                self.record_dispatch(truck, t, trip, stock, truck_location, truck_until, pending, log)
+        return {"rolling_scale": scale, "rolling_jobs": sum(q for _, q in jobs), **details}
 
     def dispatch(self, policy, t, stock, target, truck_location, truck_until, pending, log):
         cfg = self.settings
@@ -110,36 +154,19 @@ class DayModel:
         else:
             jobs = [(i, j, km, min(surplus[i], deficit[j]))
                     for i, j, km in sorted(pairs, key=lambda row: row[2])]
-        for i, j, loaded_km, amount in jobs:
+        for i, j, _, amount in jobs:
             remaining = int(min(amount, surplus[i], deficit[j]))
             while remaining > 0 and ready:
                 k = min(ready, key=lambda k: self.distance[truck_location[k], i])
                 quantity = min(remaining, cfg.truck_capacity)
-                deadhead = cfg.route_factor * self.distance[truck_location[k], i]
-                pickup_minute = minute + deadhead / cfg.truck_speed * 60
-                arrival = pickup_minute + loaded_km / cfg.truck_speed * 60
-                arrival += 2 * cfg.handling_minutes_per_bike * quantity
-                arrival_slot = max(t+1, int(np.ceil(arrival / STEP_MINUTES)))
-                if arrival_slot >= SLOTS:
+                trip = timed_trip(self.distance, cfg, t, truck_location[k], i, j, quantity)
+                if trip.arrival_slot >= SLOTS:
                     break
                 ready.remove(k)
-                current = truck_location[k]
-                stock[i] -= quantity            # reserve bikes at dispatch
-                pending[arrival_slot, j] += quantity
-                truck_location[k] = j
-                truck_until[k] = arrival_slot * STEP_MINUTES
+                self.record_dispatch(k, t, trip, stock, truck_location, truck_until, pending, log)
                 surplus[i] -= quantity
                 deficit[j] -= quantity
                 remaining -= quantity
-                log.append({
-                    "date": self.day, "truck": k+1, "dispatch_minute": minute,
-                    "truck_start": self.zones.labels[current], "pickup": self.zones.labels[i],
-                    "dropoff": self.zones.labels[j], "bikes": quantity,
-                    "pickup_minute": round(float(pickup_minute), 2),
-                    "arrival_minute": arrival_slot * STEP_MINUTES,
-                    "empty_km": float(deadhead), "loaded_km": float(loaded_km),
-                    "estimated_km": float(deadhead + loaded_km),
-                })
             if not ready:
                 break
 
@@ -189,10 +216,15 @@ class DayModel:
             extra_walking += distance * changed
         return revised, spent, offered, accepted, extra_walking
 
-    def run(self, dispatch="none", incentive="none", response="mid", speed=12.0, stock_factor=None):
+    def run(self, dispatch="none", incentive="none", response="mid", speed=12.0, stock_factor=None,
+            reward_budget=None, calibrate=True, km_penalty=None):
         if stock_factor is None:
             stock_factor = self.settings.reference_stock_factor
-        stock, carry, target, lag = self.setup(speed, stock_factor)
+        if reward_budget is None:
+            reward_budget = self.settings.incentive_budget
+        if km_penalty is None:
+            km_penalty = self.settings.rolling_km_penalty
+        stock, carry, target, lag, forecast_arrivals = self.setup(speed, stock_factor)
         stock = stock.copy()
         pending = np.zeros((SLOTS + int(lag.max()) + 2, self.n), dtype=np.int32)
         for slot, cells in enumerate(carry):
@@ -206,9 +238,15 @@ class DayModel:
         cost = walk = 0.0
         offers = accepts = missed = missed_peak = demand_peak = 0
         internal_requests = 0
+        recent_served, recent_expected = np.zeros(SLOTS), np.zeros(SLOTS)
         for t in range(SLOTS):
             stock += pending[t] + truck_arrival[t]
-            if dispatch != "none":
+            decisions = {}
+            if dispatch == "rolling":
+                scale = recent_order_scale(recent_served, recent_expected, t) if calibrate else 1.0
+                decisions = self.dispatch_rolling(t, stock, truck_location, truck_until, truck_arrival,
+                                                  route_log, forecast_arrivals, scale, km_penalty)
+            elif dispatch in ("greedy", "optimized"):
                 self.dispatch(dispatch, t, stock, target, truck_location, truck_until, truck_arrival, route_log)
             a, b = self.bounds[t:t+2]
             origins = self.origin[a:b]
@@ -223,11 +261,16 @@ class DayModel:
                 missed_peak += rejected
             ctr = np.bincount(origins[can_serve], minlength=self.n)
             stock -= ctr.astype("int32")
+            if dispatch == "rolling" and calibrate:
+                # Use only zones whose inventory did not run out in this completed slot.
+                usable = stock[:self.core] > 0
+                recent_served[t] = ctr[:self.core][usable].sum()
+                recent_expected[t] = self.departures[t, :self.core][usable].sum()
             dst = self.destination[a:b][can_serve]
             arrivals = pending + truck_arrival if incentive != "none" else pending
             dst, spent, shown, taken, distance = self.reroute(
                 incentive, response, t, dst, self.random[a:b][can_serve], stock, target,
-                arrivals, self.settings.incentive_budget - cost,
+                arrivals, reward_budget - cost,
             )
             cost += spent
             offers += shown
@@ -239,7 +282,8 @@ class DayModel:
             if expected_fleet != start_fleet or np.any(stock < 0):
                 raise RuntimeError(f"Vehicle balance violated in slot {t}.")
             slot_log.append({"slot": t, "observed_in_area": int(is_core.sum()),
-                             "simulated_missed": rejected, "parked_in_area": int(stock[:self.core].sum())})
+                             "simulated_missed": rejected, "parked_in_area": int(stock[:self.core].sum()),
+                             **decisions})
         km = float(sum(route["estimated_km"] for route in route_log))
         metrics = {
             "date": self.day, "dispatch": dispatch, "incentive": incentive, "response": response,
@@ -249,7 +293,10 @@ class DayModel:
             "peak_missed_rate": missed_peak / demand_peak,
             "loaded_trips": len(route_log), "bikes_trucked": sum(r["bikes"] for r in route_log),
             "estimated_truck_km": km, "offers": offers, "accepted": accepts,
+            "reward_budget": reward_budget,
             "reward_spend": round(cost, 2),
+            "rolling_km_penalty": km_penalty if dispatch == "rolling" else None,
+            "online_scale": calibrate if dispatch == "rolling" else None,
             "extra_walk_km_per_acceptance": (walk / accepts if accepts else 0.0),
             "reward_per_redirect": (cost / accepts if accepts else 0.0),
             "conservation_check": "pass",

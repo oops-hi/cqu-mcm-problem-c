@@ -7,7 +7,9 @@
 | [run.py](run.py) | 运行完整流程、导出表格和图表 |
 | [bike_share/demand.py](bike_share/demand.py) | 订单读取、分区、OD 和客流预测 |
 | [bike_share/operations.py](bike_share/operations.py) | 库存回放、调度和奖励，运营参数在 Settings 中 |
+| [bike_share/rolling.py](bike_share/rolling.py) | 需求校正、限时滚动整数调度 |
 | [bike_share/fences.py](bike_share/fences.py) | 电子围栏设点、定容和多平台情景 |
+| [算法优化说明](docs/solver_optimization.md) | Solver Skill 的应用、改进意见、公式和验证方法 |
 | [environment.yml](environment.yml) | Conda 环境配置 |
 | [data/](data/README.md) | 原始订单附件的本地放置说明 |
 
@@ -63,6 +65,7 @@
 | od_summary.csv、departure_forecasts.csv、forecast_metrics.csv | OD 矩阵、留出日逐区预测和模型对照 |
 | truck_schedule.csv、slot_metrics.csv | 分车的装卸任务、时段库存与未满足量 |
 | policy_metrics.csv、sensitivity.csv | 调度、奖励对照及供给敏感性 |
+| policy_comparison.csv、rolling_diagnostics.csv | 三日汇总、滚动求解状态和需求校正尺度 |
 | fence_sites.csv、fence_assignments.csv、fence_evaluation.csv | 试点位置、车位数、需求分配及留出日和竞争情景评估 |
 | demand_and_policies.png、fence_pilots.png | 预测、调度效果和地理试点图 |
 | run_summary.json | 数据范围、模型选择及主要情景参数 |
